@@ -39,8 +39,9 @@ static const int      DMA_BUF_COUNT = 4;      // Buffers DMA (doble del mínimo)
 // ============================================================================
 // PARÁMETROS ANC — ajustables en tiempo real vía Serial
 // ============================================================================
-static float g_gain     = 0.85f;   // Ganancia de salida [0.0 – 2.0]
+static float g_gain     = 0.30f;   // Ganancia de salida [0.0 – 2.0] (inicia bajo para evitar ruido)
 static float g_lp_alpha = 0.25f;   // Filtro pasa-bajas: menor → más filtrado
+static float g_noise_gate = 500.0f; // Umbral de puerta de ruido (señal < umbral = silencio)
 static const float DC_BLOCK_R = 0.995f;  // Constante del bloqueador DC
 
 // ============================================================================
@@ -50,11 +51,16 @@ static int32_t  rx_buf[BLOCK_SIZE];   // Entrada cruda (32 bits por muestra)
 static uint16_t tx_buf[BLOCK_SIZE];   // Salida empaquetada para DAC I2S (16 bits)
 
 // ============================================================================
-// ESTADO DE FILTROS
+// ESTADO DE FILTROS Y SISTEMA
 // ============================================================================
 static float dc_x1 = 0.0f;   // Entrada anterior del bloqueador DC
 static float dc_y1 = 0.0f;   // Salida anterior del bloqueador DC
 static float lp_y1 = 0.0f;   // Salida anterior del pasa-bajas
+
+static uint32_t startup_counter = 0;
+static const uint32_t MUTE_BLOCKS = (SAMPLE_RATE / BLOCK_SIZE);  // ~1 segundo de silencio al arranque
+
+static uint32_t diag_counter = 0;
 
 // ============================================================================
 // INICIALIZACIÓN DE PERIFÉRICOS I2S
@@ -146,11 +152,20 @@ static void process_serial() {
     g_lp_alpha = cmd.substring(3).toFloat();
     Serial.printf(">> LP alpha = %.3f (fc ~ %.0f Hz)\n",
                   g_lp_alpha, g_lp_alpha * SAMPLE_RATE / 6.2832f);
+  } else if (cmd.startsWith("gate ")) {
+    g_noise_gate = cmd.substring(5).toFloat();
+    Serial.printf(">> Noise gate = %.0f\n", g_noise_gate);
+  } else if (cmd == "mute") {
+    g_gain = 0.0f;
+    Serial.println(">> MUTE (gain = 0)");
+  } else if (cmd == "diag") {
+    Serial.println(">> Diagnóstico activado (5 segundos)");
+    diag_counter = 5 * (SAMPLE_RATE / BLOCK_SIZE);
   } else if (cmd == "status") {
-    Serial.printf("Gain=%.2f  LP_alpha=%.3f  SR=%u  Block=%d\n",
-                  g_gain, g_lp_alpha, SAMPLE_RATE, BLOCK_SIZE);
+    Serial.printf("Gain=%.2f  LP=%.3f  Gate=%.0f  SR=%u  Block=%d\n",
+                  g_gain, g_lp_alpha, g_noise_gate, SAMPLE_RATE, BLOCK_SIZE);
   } else {
-    Serial.println("Comandos: gain <0.0-2.0> | lp <0.01-1.0> | status");
+    Serial.println("Comandos: gain <val> | lp <val> | gate <val> | mute | diag | status");
   }
 }
 
@@ -164,10 +179,11 @@ void setup() {
   init_mic();   // I2S_NUM_1 — entrada micrófono
 
   Serial.println("=== ESP32 ANC Feedforward ===");
-  Serial.printf("INMP441 → DSP → DAC1 (GPIO 25) → TDA2030A\n");
+  Serial.printf("INMP441 -> DSP -> DAC1 (GPIO 25) -> TDA2030A\n");
   Serial.printf("Sample Rate: %u Hz | Block: %d | Gain: %.2f\n",
                 SAMPLE_RATE, BLOCK_SIZE, g_gain);
-  Serial.println("Comandos Serial: gain <val> | lp <val> | status");
+  Serial.println("Comandos: gain | lp | gate | mute | diag | status");
+  Serial.printf("Silencio inicial: ~1 segundo (estabilizacion de filtros)\n");
   Serial.println("=============================");
 }
 
@@ -183,6 +199,23 @@ void loop() {
 
   const int n = bytes_read / sizeof(int32_t);
 
+  // --- Periodo de silencio al arranque (estabiliza filtros DC y LP) ---
+  if (startup_counter < MUTE_BLOCKS) {
+    startup_counter++;
+    for (int i = 0; i < n; i++) {
+      float sample = (float)(rx_buf[i] >> 8);
+      dc_block(sample);
+      low_pass(sample);
+      tx_buf[i] = (uint16_t)(128 << 8);  // Silencio = punto medio DAC
+    }
+    i2s_write(I2S_NUM_0, tx_buf, n * sizeof(uint16_t), &bytes_written, portMAX_DELAY);
+    return;
+  }
+
+  // --- Variables para diagnóstico ---
+  float block_max = 0.0f;
+  float block_sum = 0.0f;
+
   // --- PROCESAMIENTO DSP + EMPAQUETADO DAC ---
   for (int i = 0; i < n; i++) {
     // 1. Extraer 24 bits significativos del INMP441 (justificados a la izquierda)
@@ -194,18 +227,38 @@ void loop() {
     // 3. Filtro pasa-bajas (focalizar energía cancelable)
     sample = low_pass(sample);
 
-    // 4. Inversión de fase + ganancia
+    // Diagnóstico: registrar nivel de señal después de filtros
+    float abs_sample = (sample < 0) ? -sample : sample;
+    if (abs_sample > block_max) block_max = abs_sample;
+    block_sum += abs_sample;
+
+    // 4. Puerta de ruido: si el nivel es muy bajo, emitir silencio
+    if (abs_sample < g_noise_gate) {
+      tx_buf[i] = (uint16_t)(128 << 8);
+      continue;
+    }
+
+    // 5. Inversión de fase + ganancia
     sample = -sample * g_gain;
 
-    // 5. Escalar de ~24 bits a 8 bits y centrar en 128 (punto medio DAC)
+    // 6. Escalar de ~24 bits a 8 bits y centrar en 128 (punto medio DAC)
     int32_t dac_val = (int32_t)(sample / 65536.0f) + 128;
 
-    // 6. Saturar y empaquetar para I2S DAC (valor en bits [15:8])
+    // 7. Saturar y empaquetar para I2S DAC (valor en bits [15:8])
     tx_buf[i] = (uint16_t)(clamp8(dac_val) << 8);
   }
 
   // --- ESCRITURA: DMA envía tx_buf al DAC (sin jitter) ---
   i2s_write(I2S_NUM_0, tx_buf, n * sizeof(uint16_t), &bytes_written, portMAX_DELAY);
+
+  // --- Diagnóstico periódico (si está activo) ---
+  if (diag_counter > 0) {
+    diag_counter--;
+    float block_avg = (n > 0) ? block_sum / n : 0;
+    Serial.printf("[DIAG] max=%.0f avg=%.0f gate=%.0f %s\n",
+                  block_max, block_avg, g_noise_gate,
+                  (block_max > g_noise_gate) ? "ACTIVO" : "SILENCIO");
+  }
 
   // --- Comandos serial (no bloqueante) ---
   process_serial();
