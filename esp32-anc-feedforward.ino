@@ -41,7 +41,7 @@ static const int      DMA_BUF_COUNT = 4;      // Buffers DMA
 // ============================================================================
 // PARÁMETROS ANC — ajustables en tiempo real vía Serial
 // ============================================================================
-static float g_gain       = 0.30f;    // Ganancia de salida [0.0 – 2.0]
+static float g_gain       = 0.30f;    // Ganancia de salida [0.0 – 10.0]
 static float g_lp_alpha   = 0.25f;    // Filtro pasa-bajas: menor → más filtrado
 static float g_noise_gate = 500.0f;   // Umbral de puerta de ruido
 static const float DC_BLOCK_R = 0.995f;
@@ -155,6 +155,8 @@ static void process_serial() {
 
   if (cmd.startsWith("gain ")) {
     g_gain = cmd.substring(5).toFloat();
+    if (g_gain > 10.0f) g_gain = 10.0f;
+    if (g_gain < 0.0f)  g_gain = 0.0f;
     Serial.printf(">> Ganancia = %.2f\n", g_gain);
   } else if (cmd.startsWith("lp ")) {
     g_lp_alpha = cmd.substring(3).toFloat();
@@ -173,7 +175,7 @@ static void process_serial() {
     Serial.printf("Gain=%.2f  LP=%.3f  Gate=%.0f  SR=%u  Block=%d\n",
                   g_gain, g_lp_alpha, g_noise_gate, SAMPLE_RATE, BLOCK_SIZE);
   } else {
-    Serial.println("Comandos: gain <val> | lp <val> | gate <val> | mute | diag | status");
+    Serial.println("Comandos: gain <0-10> | lp <val> | gate <val> | mute | diag | status");
   }
 }
 
