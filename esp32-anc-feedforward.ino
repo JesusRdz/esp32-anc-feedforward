@@ -78,10 +78,11 @@ static void init_mic() {
   cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
   cfg.dma_buf_count    = DMA_BUF_COUNT;
   cfg.dma_buf_len      = BLOCK_SIZE;
-  cfg.use_apll         = true;
+  cfg.use_apll         = false;
   cfg.tx_desc_auto_clear = false;
 
   i2s_pin_config_t pins = {};
+  pins.mck_io_num   = I2S_PIN_NO_CHANGE;  // Sin MCLK (INMP441 no lo necesita)
   pins.bck_io_num   = MIC_BCLK;
   pins.ws_io_num    = MIC_WS;
   pins.data_out_num = I2S_PIN_NO_CHANGE;
@@ -101,10 +102,11 @@ static void init_spk() {
   cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
   cfg.dma_buf_count    = DMA_BUF_COUNT;
   cfg.dma_buf_len      = BLOCK_SIZE;
-  cfg.use_apll         = true;
+  cfg.use_apll         = false;
   cfg.tx_desc_auto_clear = true;
 
   i2s_pin_config_t pins = {};
+  pins.mck_io_num   = I2S_PIN_NO_CHANGE;  // Sin MCLK (MAX98357A no lo necesita)
   pins.bck_io_num   = SPK_BCLK;
   pins.ws_io_num    = SPK_LRC;
   pins.data_out_num = SPK_DIN;
